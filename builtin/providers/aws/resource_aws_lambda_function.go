@@ -17,6 +17,8 @@ import (
 	"github.com/hashicorp/terraform/helper/schema"
 )
 
+const awsMutexLambdaKey = `aws_lambda_function`
+
 func resourceAwsLambdaFunction() *schema.Resource {
 	return &schema.Resource{
 		Create: resourceAwsLambdaFunctionCreate,
@@ -85,6 +87,15 @@ func resourceAwsLambdaFunction() *schema.Resource {
 				Optional: true,
 				Default:  3,
 			},
+			"publish": &schema.Schema{
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+			},
+			"version": &schema.Schema{
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 			"vpc_config": &schema.Schema{
 				Type:     schema.TypeList,
 				Optional: true,
@@ -116,6 +127,10 @@ func resourceAwsLambdaFunction() *schema.Resource {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
+			"qualified_arn": &schema.Schema{
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 			"last_modified": &schema.Schema{
 				Type:     schema.TypeString,
 				Computed: true,
@@ -141,6 +156,11 @@ func resourceAwsLambdaFunctionCreate(d *schema.ResourceData, meta interface{}) e
 
 	var functionCode *lambda.FunctionCode
 	if v, ok := d.GetOk("filename"); ok {
+		// Grab an exclusive lock so that we're only reading one function into
+		// memory at a time.
+		// See https://github.com/hashicorp/terraform/issues/9364
+		awsMutexKV.Lock(awsMutexLambdaKey)
+		defer awsMutexKV.Unlock(awsMutexLambdaKey)
 		file, err := loadFileContent(v.(string))
 		if err != nil {
 			return fmt.Errorf("Unable to load %q: %s", v.(string), err)
@@ -173,6 +193,7 @@ func resourceAwsLambdaFunctionCreate(d *schema.ResourceData, meta interface{}) e
 		Role:         aws.String(iamRole),
 		Runtime:      aws.String(d.Get("runtime").(string)),
 		Timeout:      aws.Int64(int64(d.Get("timeout").(int))),
+		Publish:      aws.Bool(d.Get("publish").(bool)),
 	}
 
 	if v, ok := d.GetOk("vpc_config"); ok {
@@ -181,19 +202,21 @@ func resourceAwsLambdaFunctionCreate(d *schema.ResourceData, meta interface{}) e
 			return err
 		}
 
-		var subnetIds []*string
-		for _, id := range config["subnet_ids"].(*schema.Set).List() {
-			subnetIds = append(subnetIds, aws.String(id.(string)))
-		}
+		if config != nil {
+			var subnetIds []*string
+			for _, id := range config["subnet_ids"].(*schema.Set).List() {
+				subnetIds = append(subnetIds, aws.String(id.(string)))
+			}
 
-		var securityGroupIds []*string
-		for _, id := range config["security_group_ids"].(*schema.Set).List() {
-			securityGroupIds = append(securityGroupIds, aws.String(id.(string)))
-		}
+			var securityGroupIds []*string
+			for _, id := range config["security_group_ids"].(*schema.Set).List() {
+				securityGroupIds = append(securityGroupIds, aws.String(id.(string)))
+			}
 
-		params.VpcConfig = &lambda.VpcConfig{
-			SubnetIds:        subnetIds,
-			SecurityGroupIds: securityGroupIds,
+			params.VpcConfig = &lambda.VpcConfig{
+				SubnetIds:        subnetIds,
+				SecurityGroupIds: securityGroupIds,
+			}
 		}
 	}
 
@@ -268,6 +291,45 @@ func resourceAwsLambdaFunctionRead(d *schema.ResourceData, meta interface{}) err
 	}
 	d.Set("source_code_hash", function.CodeSha256)
 
+	// List is sorted from oldest to latest
+	// so this may get costly over time :'(
+	var lastVersion, lastQualifiedArn string
+	err = listVersionsByFunctionPages(conn, &lambda.ListVersionsByFunctionInput{
+		FunctionName: function.FunctionName,
+		MaxItems:     aws.Int64(10000),
+	}, func(p *lambda.ListVersionsByFunctionOutput, lastPage bool) bool {
+		if lastPage {
+			last := p.Versions[len(p.Versions)-1]
+			lastVersion = *last.Version
+			lastQualifiedArn = *last.FunctionArn
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		return err
+	}
+
+	d.Set("version", lastVersion)
+	d.Set("qualified_arn", lastQualifiedArn)
+
+	return nil
+}
+
+func listVersionsByFunctionPages(c *lambda.Lambda, input *lambda.ListVersionsByFunctionInput,
+	fn func(p *lambda.ListVersionsByFunctionOutput, lastPage bool) bool) error {
+	for {
+		page, err := c.ListVersionsByFunction(input)
+		if err != nil {
+			return err
+		}
+		lastPage := page.NextMarker == nil
+
+		shouldContinue := fn(page, lastPage)
+		if !shouldContinue || lastPage {
+			break
+		}
+	}
 	return nil
 }
 
@@ -299,29 +361,37 @@ func resourceAwsLambdaFunctionUpdate(d *schema.ResourceData, meta interface{}) e
 
 	d.Partial(true)
 
-	codeReq := &lambda.UpdateFunctionCodeInput{
-		FunctionName: aws.String(d.Id()),
-	}
-
-	codeUpdate := false
-	if d.HasChange("filename") || d.HasChange("source_code_hash") {
-		name := d.Get("filename").(string)
-		file, err := loadFileContent(name)
-		if err != nil {
-			return fmt.Errorf("Unable to load %q: %s", name, err)
+	if d.HasChange("filename") || d.HasChange("source_code_hash") || d.HasChange("s3_bucket") || d.HasChange("s3_key") || d.HasChange("s3_object_version") {
+		codeReq := &lambda.UpdateFunctionCodeInput{
+			FunctionName: aws.String(d.Id()),
+			Publish:      aws.Bool(d.Get("publish").(bool)),
 		}
-		codeReq.ZipFile = file
-		codeUpdate = true
-	}
-	if d.HasChange("s3_bucket") || d.HasChange("s3_key") || d.HasChange("s3_object_version") {
-		codeReq.S3Bucket = aws.String(d.Get("s3_bucket").(string))
-		codeReq.S3Key = aws.String(d.Get("s3_key").(string))
-		codeReq.S3ObjectVersion = aws.String(d.Get("s3_object_version").(string))
-		codeUpdate = true
-	}
 
-	if codeUpdate {
+		if v, ok := d.GetOk("filename"); ok {
+			// Grab an exclusive lock so that we're only reading one function into
+			// memory at a time.
+			// See https://github.com/hashicorp/terraform/issues/9364
+			awsMutexKV.Lock(awsMutexLambdaKey)
+			defer awsMutexKV.Unlock(awsMutexLambdaKey)
+			file, err := loadFileContent(v.(string))
+			if err != nil {
+				return fmt.Errorf("Unable to load %q: %s", v.(string), err)
+			}
+			codeReq.ZipFile = file
+		} else {
+			s3Bucket, _ := d.GetOk("s3_bucket")
+			s3Key, _ := d.GetOk("s3_key")
+			s3ObjectVersion, versionOk := d.GetOk("s3_object_version")
+
+			codeReq.S3Bucket = aws.String(s3Bucket.(string))
+			codeReq.S3Key = aws.String(s3Key.(string))
+			if versionOk {
+				codeReq.S3ObjectVersion = aws.String(s3ObjectVersion.(string))
+			}
+		}
+
 		log.Printf("[DEBUG] Send Update Lambda Function Code request: %#v", codeReq)
+
 		_, err := conn.UpdateFunctionCode(codeReq)
 		if err != nil {
 			return fmt.Errorf("Error modifying Lambda Function Code %s: %s", d.Id(), err)
@@ -400,6 +470,11 @@ func validateVPCConfig(v interface{}) (map[string]interface{}, error) {
 
 	if !ok {
 		return nil, errors.New("vpc_config is <nil>")
+	}
+
+	// if subnet_ids and security_group_ids are both empty then the VPC is optional
+	if config["subnet_ids"].(*schema.Set).Len() == 0 && config["security_group_ids"].(*schema.Set).Len() == 0 {
+		return nil, nil
 	}
 
 	if config["subnet_ids"].(*schema.Set).Len() == 0 {
